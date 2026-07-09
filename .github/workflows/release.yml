@@ -1,653 +1,552 @@
-name: Release
+name: Build and Release whisper-server Binaries
+
+# Ziee fork release workflow. Mirrors the ziee-ai/llama.cpp fork's release.yml
+# (same build-matrix + separate CUDA/ROCm container jobs + a create-release
+# collector), adapted to whisper.cpp's `whisper-server` target.
+#
+# ONE deliberate difference from the llama.cpp fork: this workflow publishes a
+# `<asset>.sha256` sidecar next to EVERY archive. The ziee voice runtime's
+# downloader (`server/src/modules/voice/engine/download.rs`) treats the sidecar
+# as MANDATORY (like `build_helper/biomcp.rs`) and refuses to install an
+# unverified artifact — it does NOT trust-on-first-use the way the llama/mistral
+# downloader does. The sidecar body is `sha256sum` output (`<64-hex>  <name>`);
+# the downloader takes the first whitespace-delimited token.
+#
+# The published asset-name contract (consumed by `archive_name()` /
+# `asset_backend()` in the voice downloader) is:
+#   whisper-server-<platform>-<arch>-<backend>.<tar.gz|zip>
+#   whisper-server-<platform>-<arch>-<backend>.<tar.gz|zip>.sha256
+# where platform ∈ {linux,macos,windows}, arch ∈ {x86_64,aarch64},
+# backend ∈ {cpu,metal,cuda<major.minor>,rocm<major.minor>}.
 
 on:
-  workflow_dispatch:
-    inputs:
-      create_release:
-        description: 'Create new release'
-        required: true
-        type: boolean
-      pre_release_tag:
-        description: 'Pre-release tag name'
-        required: false
-        type: string
-
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.9.1)'
+        required: true
+        type: string
+      platform:
+        description: 'Platform to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - linux
+          - macos
+          - windows
+      backend:
+        description: 'Backend to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - cpu
+          - metal
+          - cuda
+          - rocm
 
-env:
-  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-
+# note: run this workflow one at a time for better cache reuse
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write  # for creating release
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  determine-tag:
-    runs-on: ubuntu-latest
-    outputs:
-      tag_name: ${{ steps.tag.outputs.name }}
-      should_release: ${{ steps.tag.outputs.should_release }}
-
-    steps:
-      - name: Checkout with full history
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          fetch-depth: 0
-
-      - name: Determine tag name
-        id: tag
-        shell: bash
-        run: |
-          BUILD_NUMBER=$(git rev-list --count HEAD)
-          SHORT_HASH=$(git rev-parse --short=7 HEAD)
-          CUSTOM_TAG="${{ github.event.inputs.pre_release_tag }}"
-          SHOULD_RELEASE="false"
-
-          echo "Raw values:"
-          echo "BUILD_NUMBER: $BUILD_NUMBER"
-          echo "SHORT_HASH: $SHORT_HASH"
-          echo "BRANCH_NAME: ${{ env.BRANCH_NAME }}"
-          echo "CUSTOM_TAG: $CUSTOM_TAG"
-
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "Using pushed tag name"
-            TAG_NAME="${{ github.ref_name }}"
-            SHOULD_RELEASE="true"
-          elif [[ -n "$CUSTOM_TAG" ]]; then
-            echo "Using custom tag"
-            TAG_NAME="${CUSTOM_TAG}"
-            SHOULD_RELEASE="true"
-          elif [[ "${{ github.event.inputs.create_release }}" == "true" ]]; then
-            echo "Manual release requested"
-            SHOULD_RELEASE="true"
-            TAG_NAME="b${BUILD_NUMBER}"
-          elif [[ "${{ env.BRANCH_NAME }}" == "master" ]]; then
-            echo "Using master branch format"
-            TAG_NAME="b${BUILD_NUMBER}"
-            SHOULD_RELEASE="false"
-          else
-            echo "Using non-master branch format"
-            SAFE_NAME=$(echo "${{ env.BRANCH_NAME }}" | tr '/' '-')
-            TAG_NAME="${SAFE_NAME}-b${BUILD_NUMBER}-${SHORT_HASH}"
-            SHOULD_RELEASE="false"
-          fi
-
-          echo "Final tag name: $TAG_NAME"
-          echo "Should release: $SHOULD_RELEASE"
-          echo "name=$TAG_NAME" >> $GITHUB_OUTPUT
-          echo "should_release=$SHOULD_RELEASE" >> $GITHUB_OUTPUT
-
-  ubuntu-cpu:
+  build-matrix:
+    # Include matrix.version_suffix so the two Windows-CUDA entries get distinct
+    # names in the Actions UI instead of both showing "Build windows-x86_64-cuda".
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.backend }}${{ matrix.version_suffix }}
     runs-on: ${{ matrix.os }}
-    needs: determine-tag
-    if: ${{ needs.determine-tag.outputs.should_release == 'true' }}
 
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - build: x64
-            os: ubuntu-22.04
-          - build: arm64
-            os: ubuntu-22.04-arm
+          # Linux x86_64 - CPU only (CUDA + ROCm are in the container jobs below)
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x86_64
+            backend: cpu
+
+          # macOS aarch64 - Metal (combined with CPU; the primary Apple target)
+          - os: macos-14  # M1 runner
+            platform: macos
+            arch: aarch64
+            backend: metal
+
+          # Windows x86_64 - CPU, CUDA (12 + 13)
+          - os: windows-2022
+            platform: windows
+            arch: x86_64
+            backend: cpu
+          # Windows-CUDA uses the vendored ./.github/actions/windows-setup-cuda
+          # (copied verbatim from the ziee-ai/llama.cpp fork), which fetches each
+          # CUDA redist zip explicitly — critically cuda_crt for the 13.x line,
+          # which Jimver/cuda-toolkit doesn't (issue #437). It only supports the
+          # version pins baked into its case table: 12.4 and 13.3 here.
+          - os: windows-2022
+            platform: windows
+            arch: x86_64
+            backend: cuda
+            cuda_version: "12.4"
+            version_suffix: "12.4"
+            cuda_archs: "52;61;70;75;80;86;89;90"
+          - os: windows-2022
+            platform: windows
+            arch: x86_64
+            backend: cuda
+            cuda_version: "13.3"
+            version_suffix: "13.3"
+            cuda_archs: "75;80;86;89;90;100;120"
 
     steps:
-      - name: Clone
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Check build filter
+        id: filter
+        shell: bash
+        run: |
+          PLATFORM_MATCH="false"
+          BACKEND_MATCH="false"
+          if [ "${{ inputs.platform }}" == "all" ] || [ "${{ inputs.platform }}" == "" ] || [ "${{ inputs.platform }}" == "${{ matrix.platform }}" ]; then
+            PLATFORM_MATCH="true"
+          fi
+          if [ "${{ inputs.backend }}" == "all" ] || [ "${{ inputs.backend }}" == "" ] || [ "${{ inputs.backend }}" == "${{ matrix.backend }}" ]; then
+            BACKEND_MATCH="true"
+          fi
+          if [ "$PLATFORM_MATCH" == "true" ] && [ "$BACKEND_MATCH" == "true" ]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "✅ Build will run: platform=${{ matrix.platform }}, backend=${{ matrix.backend }}"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Skipping: platform=${{ matrix.platform }}, backend=${{ matrix.backend }}"
+          fi
+
+      - name: Checkout repository
+        if: steps.filter.outputs.should_run == 'true'
+        uses: actions/checkout@v4
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        if: steps.filter.outputs.should_run == 'true'
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: release-${{ matrix.os }}-cpu
-          evict-old-files: 1d
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.backend }}${{ matrix.version_suffix }}
+          max-size: 500M
+          update-package-index: true
 
-      - name: Dependencies
+      - name: Install Linux dependencies
+        if: steps.filter.outputs.should_run == 'true' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake
 
-      - name: Build
+      - name: Install macOS dependencies
+        if: steps.filter.outputs.should_run == 'true' && runner.os == 'macOS'
         run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_NATIVE=OFF \
-            ${{ matrix.build == 'x64' && '-DGGML_CPU_ALL_VARIANTS=ON' || '-DGGML_CPU_ARM_ARCH=armv8-a' }}
-          cmake --build build --config Release -j $(nproc)
+          brew install cmake
 
-      - name: Pack artifacts
+      - name: Setup MSVC (Windows)
+        if: steps.filter.outputs.should_run == 'true' && runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CUDA toolkit (Windows)
+        if: steps.filter.outputs.should_run == 'true' && runner.os == 'Windows' && matrix.backend == 'cuda'
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda_version }}
+
+      - name: Build whisper-server
+        if: steps.filter.outputs.should_run == 'true'
+        shell: bash
         run: |
-          cp LICENSE ./build/bin/
-          tar -czvf whisper-bin-ubuntu-${{ matrix.build }}.tar.gz \
-            --transform "s,^\.,whisper-bin-ubuntu-${{ matrix.build }}," \
-            -C ./build/bin .
+          mkdir build
+          cd build
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          path: whisper-bin-ubuntu-${{ matrix.build }}.tar.gz
-          name: whisper-bin-ubuntu-${{ matrix.build }}.tar.gz
+          # Server-only build: skip tests, keep examples ON so the static
+          # `common`/`json_cpp` libs that `whisper-server` links against are
+          # built, and turn the server target ON explicitly.
+          CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_BUILD_TESTS=OFF"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_BUILD_EXAMPLES=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_BUILD_SERVER=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF"
 
-  windows:
-    runs-on: windows-latest
-    needs: determine-tag
+          # Portability: don't tune for the build machine CPU; dynamic backends.
+          CMAKE_ARGS="$CMAKE_ARGS -DGGML_NATIVE=OFF"
+          CMAKE_ARGS="$CMAKE_ARGS -DGGML_BACKEND_DL=ON"
 
-    strategy:
-      matrix:
-        build: [Release]
-        arch: [Win32, x64]
-        sdl2: [ON]
-        include:
-          - arch: Win32
-            s2arc: x86
-            jnaPath: win32-x86
-          - arch: x64
-            s2arc: x64
-            jnaPath: win32-x86-64
-          - sdl2: ON
-            s2ver: 2.28.5
+          if [ "${{ runner.os }}" == "Linux" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_INSTALL_RPATH='\$ORIGIN'"
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+            if [ "${{ matrix.arch }}" == "x86_64" ]; then
+              CMAKE_ARGS="$CMAKE_ARGS -DGGML_CPU_ALL_VARIANTS=ON"
+            fi
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_INSTALL_RPATH='@loader_path'"
+            CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+            if [ "${{ matrix.backend }}" == "metal" ]; then
+              CMAKE_ARGS="$CMAKE_ARGS -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+            fi
+          elif [ "${{ runner.os }}" == "Windows" ]; then
+            if [ "${{ matrix.backend }}" == "cuda" ]; then
+              export CMAKE_GENERATOR='Ninja Multi-Config'
+            fi
+          fi
 
-    steps:
-      - name: Clone
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+          if [ "${{ matrix.backend }}" == "cuda" ]; then
+            CMAKE_ARGS="$CMAKE_ARGS -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}"
+          fi
 
-      - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-      - name: Fetch SDL2 and set SDL2_DIR
-        if: matrix.sdl2 == 'ON'
+          cmake .. $CMAKE_ARGS
+          cmake --build . --config Release --target whisper-server -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+          echo "Build complete"
+          ls -lah bin/ || ls -lah Release/ || ls -lah .
+
+      - name: Find binary path
+        if: steps.filter.outputs.should_run == 'true'
+        id: find_binary
+        shell: bash
         run: |
-          C:/msys64/usr/bin/wget.exe -qO sdl2.zip https://github.com/libsdl-org/SDL/releases/download/release-${{ matrix.s2ver }}/SDL2-devel-${{ matrix.s2ver }}-VC.zip
-          7z x sdl2.zip
-          echo "SDL2_DIR=$env:GITHUB_WORKSPACE/SDL2-${{ matrix.s2ver }}/cmake" >> $env:GITHUB_ENV
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BINARY_PATH=$(find build -name "whisper-server.exe" -type f | head -n 1)
+            BINARY_NAME="whisper-server.exe"
+          else
+            BINARY_PATH=$(find build/bin -name "whisper-server" -type f 2>/dev/null | head -n 1)
+            if [ -z "$BINARY_PATH" ]; then
+              BINARY_PATH=$(find build -name "whisper-server" -type f ! -name "*.d" | head -n 1)
+            fi
+            BINARY_NAME="whisper-server"
+          fi
+          if [ -z "$BINARY_PATH" ]; then
+            echo "ERROR: Binary not found!"
+            find build -type f -name "*whisper-server*" || true
+            exit 1
+          fi
+          echo "binary_path=$BINARY_PATH" >> $GITHUB_OUTPUT
+          echo "binary_name=$BINARY_NAME" >> $GITHUB_OUTPUT
+          echo "Found binary at: $BINARY_PATH"
 
-      - name: Configure
-        run: >
-          cmake -S . -B ./build -A ${{ matrix.arch }}
-          -DCMAKE_BUILD_TYPE=${{ matrix.build }}
-          -DBUILD_SHARED_LIBS=ON
-          -DWHISPER_SDL2=${{ matrix.sdl2 }}
-          -DGGML_NATIVE=OFF
-          ${{ matrix.arch == 'x64' && '-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON' || '-DGGML_BMI2=OFF' }}
-
-      - name: Build
+      - name: Prepare release archive
+        if: steps.filter.outputs.should_run == 'true'
+        shell: bash
         run: |
-          cd ./build
-          msbuild ALL_BUILD.vcxproj -t:build -p:configuration=${{ matrix.build }} -p:platform=${{ matrix.arch }}
+          mkdir -p release
+          cp "${{ steps.find_binary.outputs.binary_path }}" "release/${{ steps.find_binary.outputs.binary_name }}"
 
-      - name: Copy SDL2.dll
-        if: matrix.sdl2 == 'ON'
-        run: copy "$env:SDL2_DIR/../lib/${{ matrix.s2arc }}/SDL2.dll" build/bin/${{ matrix.build }}
+          # Shared libs must sit alongside the binary (RPATH is $ORIGIN /
+          # @loader_path), so `tar xzf && ./whisper-server` works with no
+          # LD_LIBRARY_PATH. Glob everything to survive future ggml lib splits.
+          if [ -d "build/bin/Release" ]; then
+            BUILD_LIB_DIR="build/bin/Release"
+          else
+            BUILD_LIB_DIR="build/bin"
+          fi
+          echo "Copying shared libraries from $BUILD_LIB_DIR"
 
-      - name: Upload SDL2.dll
-        if: matrix.sdl2 == 'ON'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ${{ matrix.s2arc }}_SDL2.dll
-          path: build/bin/${{ matrix.build }}/SDL2.dll
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            find "$BUILD_LIB_DIR" -maxdepth 1 -name "*.dll" -exec cp {} release/ \;
+            ls -lh release/*.dll 2>/dev/null || echo "No DLLs found"
+          elif [ "${{ runner.os }}" == "macOS" ]; then
+            find "$BUILD_LIB_DIR" -maxdepth 1 -name "*.dylib" -exec cp -H {} release/ \;
+            find "$BUILD_LIB_DIR" -maxdepth 1 -name "*.so" -exec cp {} release/ \;
+            ls -lh release/*.dylib release/*.so 2>/dev/null || echo "No libraries found"
+          else
+            find "$BUILD_LIB_DIR" -maxdepth 1 \( -name "*.so" -o -name "*.so.*" \) -exec cp -P {} release/ \;
+            if [ -d "build/ggml/src" ]; then
+              find "build/ggml/src" -maxdepth 1 \( -name "*.so" -o -name "*.so.*" \) -exec cp -P {} release/ \;
+            fi
+            ls -lh release/*.so 2>/dev/null || echo "No libraries found"
+          fi
 
-      - name: Upload whisper dll
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: whisper_${{ matrix.arch }}.dll
-          path: build/bin/${{ matrix.build }}/whisper.dll
+          echo "whisper-server" > release/version.txt
+          echo "${{ github.ref_name }}" >> release/version.txt
+          echo "Backend: ${{ matrix.backend }}${{ matrix.version_suffix }}" >> release/version.txt
+          echo "Platform: ${{ matrix.platform }}-${{ matrix.arch }}" >> release/version.txt
+          echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> release/version.txt
 
-      - name: Upload ggml dll
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ggml_${{ matrix.arch }}.dll
-          path: build/bin/${{ matrix.build }}/ggml.dll
-          overwrite: true
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            chmod +x "release/${{ steps.find_binary.outputs.binary_name }}"
+          fi
+          ls -lah release/
 
-      - name: Upload ggml base dll
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ggml_base_${{ matrix.arch }}.dll
-          path: build/bin/${{ matrix.build }}/ggml-base.dll
-
-      - name: Upload ggml cpu dll
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ggml_cpu_${{ matrix.arch }}.dll
-          path: build/bin/${{ matrix.build }}/ggml-cpu.dll
-
-      - name: Pack bin artifacts
-        shell: pwsh
+      - name: Create archive
+        if: steps.filter.outputs.should_run == 'true'
+        shell: bash
         run: |
-              Compress-Archive -Path "build/bin/${{ matrix.build }}" -DestinationPath "whisper-bin-${{ matrix.arch }}.zip"
+          SUFFIX=""
+          if [ -n "${{ matrix.version_suffix }}" ]; then
+            SUFFIX="${{ matrix.version_suffix }}"
+          fi
+          ARCHIVE_NAME="whisper-server-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.backend }}${SUFFIX}"
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            7z a "${ARCHIVE_NAME}.zip" ./release/*
+            echo "ARCHIVE_FILE=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
+            echo "ARTIFACT_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          else
+            tar czf "${ARCHIVE_NAME}.tar.gz" -C release .
+            echo "ARCHIVE_FILE=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+            echo "ARTIFACT_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          fi
 
-      - name: Upload binaries
-        if: matrix.sdl2 == 'ON' && ${{ needs.determine-tag.outputs.should_release }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - name: Upload artifact
+        if: steps.filter.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
         with:
-          name: whisper-bin-${{ matrix.arch }}.zip
-          path: whisper-bin-${{ matrix.arch }}.zip
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARCHIVE_FILE }}
+          retention-days: 7
 
-  windows-blas:
-    runs-on: windows-latest
-    needs: determine-tag
-
-    strategy:
-      matrix:
-        build: [Release]
-        arch: [Win32, x64]
-        blas: [ON]
-        sdl2: [ON]
-        blasver: [0.3.29]
-        include:
-          - arch: Win32
-            s2arc: x86
-            blasfile: x86
-          - arch: x64
-            s2arc: x64
-            blasfile: x64_64
-          - sdl2: ON
-            s2ver: 2.28.5
-
-    steps:
-      - name: Clone
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
-
-      - name: Install OpenBLAS and pkgconfiglite
-        if: matrix.blas == 'ON'
-        run: |
-          Invoke-WebRequest "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${{matrix.blasver}}/OpenBLAS-${{matrix.blasver}}_${{matrix.blasfile}}.zip" -OutFile "OpenBLAS-${{matrix.blasver}}.zip"
-          Expand-Archive "OpenBLAS-${{matrix.blasver}}.zip" -DestinationPath "OpenBLAS-${{matrix.blasver}}"
-          choco install pkgconfiglite
-
-      - name: Fetch SDL2 and set SDL2_DIR
-        if: matrix.sdl2 == 'ON'
-        run: |
-          C:/msys64/usr/bin/wget.exe -qO sdl2.zip https://github.com/libsdl-org/SDL/releases/download/release-${{ matrix.s2ver }}/SDL2-devel-${{ matrix.s2ver }}-VC.zip
-          7z x sdl2.zip
-          echo "SDL2_DIR=$env:GITHUB_WORKSPACE/SDL2-${{ matrix.s2ver }}/cmake" >> $env:GITHUB_ENV
-
-      - name: Configure
-        run: >
-          cmake -S . -B ./build -A ${{ matrix.arch }}
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DCMAKE_BUILD_TYPE=${{ matrix.build }}
-          -DGGML_BLAS=${{ matrix.blas }}
-          -DGGML_BLAS_VENDOR=OpenBLAS
-          -DBLAS_LIBRARIES="$env:GITHUB_WORKSPACE/OpenBLAS-${{matrix.blasver}}/lib/libopenblas.lib"
-          -DBLAS_INCLUDE_DIRS="$env:GITHUB_WORKSPACE/OpenBLAS-${{matrix.blasver}}/include"
-          -DWHISPER_SDL2=${{ matrix.sdl2 }}
-          -DGGML_NATIVE=OFF
-          ${{ matrix.arch == 'x64' && '-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON' || '-DGGML_BMI2=OFF' }}
-
-      - name: Build
-        run: |
-          cd ./build
-          msbuild ALL_BUILD.vcxproj -t:build -p:configuration=${{ matrix.build }} -p:platform=${{ matrix.arch }}
-
-      - name: Copy openblas.dll
-        if: matrix.blas == 'ON'
-        run: copy "$env:GITHUB_WORKSPACE/OpenBLAS-${{matrix.blasver}}/bin/libopenblas.dll" build/bin/${{ matrix.build }}
-
-      - name: Copy SDL2.dll
-        if: matrix.sdl2 == 'ON'
-        run: copy "$env:SDL2_DIR/../lib/${{ matrix.s2arc }}/SDL2.dll" build/bin/${{ matrix.build }}
-
-      - name: Pack bin artifacts
-        shell: pwsh
-        run: |
-              Compress-Archive -Path "build/bin/${{ matrix.build }}" -DestinationPath "whisper-blas-bin-${{ matrix.arch }}.zip"
-
-      - name: Upload binaries
-        if: matrix.blas == 'ON' && matrix.sdl2 == 'ON' && ${{ needs.determine-tag.outputs.should_release }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: whisper-blas-bin-${{ matrix.arch }}.zip
-          path: whisper-blas-bin-${{ matrix.arch }}.zip
-
-  windows-cublas:
-    runs-on: windows-2022
-    needs: determine-tag
+  # Linux CUDA — Docker container, matrix-ized 12.x + 13.x (ship both; drivers
+  # and sm_* archs diverge, same as the llama.cpp fork).
+  build-cuda:
+    name: Build linux-x86_64-cuda${{ matrix.version_suffix }}
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu22.04
     strategy:
       fail-fast: false
       matrix:
-        build: [Release]
-        arch: [x64]
-        cublas: [ON]
-        sdl2: [ON]
-        cuda-toolkit: [12.4.0, 11.8.0]
         include:
-          - arch: x64
-            sdl2: ON
-            sdl2_ver: 2.28.5
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Install Ninja
-        id: install_ninja
-        run: |
-          choco install ninja
-
-      - name: Install ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: ${{ github.job }}-${{ matrix.cuda-toolkit }}-${{ matrix.build }}
-          evict-old-files: 5d
-
-      - name: Install Cuda Toolkit 11.8.0
-        if: ${{ matrix.cuda-toolkit == '11.8.0' }}
-        run: |
-          $CUDA_VERSION = ${{ matrix.cuda-toolkit }}
-          $CUDA_TOOLKIT_DIR = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$CUDA_VERSION"
-          $CUDA_DOWNLOAD = "https://developer.download.nvidia.com/compute/cuda/redist"
-
-          # Components versions
-          $CUDART_VER = "11.8.89"
-          $NVCC_VER   = "11.8.89"
-          $NVRTC_VER  = "11.8.89"
-          $CUBLAS_VER = "11.8.1.74"
-          $NVTX_VER   = "11.8.86"
-          $VS_VER     = "11.8.86"
-          $NVPROF_VER = "11.8.87"
-          $CCCL_VER   = "11.8.89"
-
-          # Create the directory where the CUDA Toolkit will be installed
-          mkdir -p $CUDA_TOOLKIT_DIR
-
-          # Install unzip to extract the downloaded files
-          choco install unzip -y
-
-          # Download all the required components
-          curl -O "$CUDA_DOWNLOAD/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-${CUDART_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-${NVCC_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-${NVRTC_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/libcublas/windows-x86_64/libcublas-windows-x86_64-${CUBLAS_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-${NVTX_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-${VS_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-${NVPROF_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-${CCCL_VER}-archive.zip"
-
-          # Extract all the downloaded files to the CUDA Toolkit directory
-          unzip '*.zip' -d $CUDA_TOOLKIT_DIR
-
-          # Copy all the extracted files to the main CUDA Toolkit directory
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_cudart-windows-x86_64-${CUDART_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvcc-windows-x86_64-${NVCC_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvrtc-windows-x86_64-${NVRTC_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\libcublas-windows-x86_64-${CUBLAS_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvtx-windows-x86_64-${NVTX_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvprof-windows-x86_64-${NVPROF_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_cccl-windows-x86_64-${CCCL_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\visual_studio_integration-windows-x86_64-${VS_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-
-          # Visual Studio integration
-          xcopy "$CUDA_TOOLKIT_DIR\visual_studio_integration-windows-x86_64-${VS_VER}-archive\visual_studio_integration\MSBuildExtensions\*" "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\BuildCustomizations" /E /I /H /Y
-
-          # Set environment variables
-          echo "$CUDA_TOOLKIT_DIR\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "$CUDA_TOOLKIT_DIR\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "CUDA_PATH=$CUDA_TOOLKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "CUDA_PATH_V11_8=$CUDA_TOOLKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Install Cuda Toolkit 12.4.0
-        if: ${{ matrix.cuda-toolkit == '12.4.0' }}
-        run: |
-          $CUDA_VERSION = ${{ matrix.cuda-toolkit }}
-          $CUDA_TOOLKIT_DIR = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$CUDA_VERSION"
-          $CUDA_DOWNLOAD = "https://developer.download.nvidia.com/compute/cuda/redist"
-
-          # Components versions
-          $CUDART_VER   = "12.4.127"
-          $NVCC_VER     = "12.4.131"
-          $NVRTC_VER    = "12.4.127"
-          $CUBLAS_VER   = "12.4.5.8"
-          $NVTX_VER     = "12.4.127"
-          $PROFILER_VER = "12.4.127"
-          $VS_VER       = "12.4.127"
-          $NVPROF_VER   = "12.4.128"
-          $CCCL_VER     = "12.4.127"
-
-          # Create the directory where the CUDA Toolkit will be installed
-          mkdir -p $CUDA_TOOLKIT_DIR
-
-          # Install unzip to extract the downloaded files
-          choco install unzip -y
-
-          # Download all the required components
-          curl -O "$CUDA_DOWNLOAD/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-${CUDART_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-${NVCC_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-${NVRTC_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/libcublas/windows-x86_64/libcublas-windows-x86_64-${CUBLAS_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-${NVTX_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-${PROFILER_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-${VS_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_nvprof/windows-x86_64/cuda_nvprof-windows-x86_64-${NVPROF_VER}-archive.zip"
-          curl -O "$CUDA_DOWNLOAD/cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-${CCCL_VER}-archive.zip"
-
-          # Extract all the downloaded files to the CUDA Toolkit directory
-          unzip -q '*.zip' -d $CUDA_TOOLKIT_DIR
-
-          # Copy all the extracted files to the main CUDA Toolkit directory
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_cudart-windows-x86_64-${CUDART_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvcc-windows-x86_64-${NVCC_VER}-archive\*"     "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvrtc-windows-x86_64-${NVRTC_VER}-archive\*"   "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\libcublas-windows-x86_64-${CUBLAS_VER}-archive\*"   "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvtx-windows-x86_64-${NVTX_VER}-archive\*"     "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_nvprof-windows-x86_64-${NVPROF_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_cccl-windows-x86_64-${CCCL_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\cuda_profiler_api-windows-x86_64-${PROFILER_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-          xcopy "$CUDA_TOOLKIT_DIR\visual_studio_integration-windows-x86_64-${VS_VER}-archive\*" "$CUDA_TOOLKIT_DIR" /E /I /H /Y
-
-          # Visual Studio integration
-          xcopy "$CUDA_TOOLKIT_DIR\visual_studio_integration-windows-x86_64-${VS_VER}-archive\visual_studio_integration\MSBuildExtensions\*" "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\BuildCustomizations" /E /I /H /Y
-
-          # Set environment variables
-          echo "$CUDA_TOOLKIT_DIR\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "$CUDA_TOOLKIT_DIR\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "CUDA_PATH=$CUDA_TOOLKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          echo "CUDA_PATH_V12_2=$CUDA_TOOLKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
-
-      - name: Install 7-Zip
-        run: choco install 7zip -y
-
-      - name: Fetch SDL2 and set SDL2_DIR
-        if: matrix.sdl2 == 'ON'
-        run: |
-          Invoke-WebRequest -Uri https://github.com/libsdl-org/SDL/releases/download/release-${{ matrix.sdl2_ver }}/SDL2-devel-${{ matrix.sdl2_ver }}-VC.zip -OutFile sdl2.zip
-          7z x sdl2.zip
-          echo "SDL2_DIR=${{ github.workspace }}\SDL2-${{ matrix.sdl2_ver }}\cmake" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "${{ github.workspace }}\SDL2-${{ matrix.sdl2_ver }}\cmake" > SDL2_PATH.txt
-
-      - name: Install cmake
-        run: choco install cmake
-
-      - name: Build Project
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cmake --version
-          where cmake
-          if "${{ matrix.cuda-toolkit }}" == "11.8.0" (
-            set CUDA_FLAGS=-allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
-          ) else (
-            set CUDA_FLAGS=
-          )
-          cmake -S . -B build -G "Ninja Multi-Config" ^
-            -DCMAKE_BUILD_TYPE=${{ matrix.build }} ^
-            -DGGML_CUDA=${{ matrix.cublas }} ^
-            -DWHISPER_SDL2=${{ matrix.sdl2 }} ^
-            -DSDL2_DIR="%SDL2_DIR%" ^
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ^
-            -DCMAKE_CUDA_FLAGS="%CUDA_FLAGS%" ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_CPU_ALL_VARIANTS=ON
-          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config ${{ matrix.build }} -j %NUMBER_OF_PROCESSORS%
-
-      - name: Check ccache status after build
-        run: |
-          ccache --show-stats
-
-      - name: Copy CUDA DLLs
-        run: |
-          Get-ChildItem "$env:CUDA_PATH\bin\" -Filter "*.dll" |
-          Copy-Item -Destination "build/bin/${{ matrix.build }}"
-
-      - name: Copy SDL2.dll
-        if: matrix.sdl2 == 'ON'
-        run: copy "$env:SDL2_DIR/../lib/${{ matrix.arch }}/SDL2.dll" build/bin/${{ matrix.build }}
-
-      - name: Pack bin artifacts
-        shell: pwsh
-        run: |
-              Compress-Archive -Path "build/bin/${{ matrix.build }}" -DestinationPath "whisper-cublas-${{ matrix.cuda-toolkit }}-bin-${{ matrix.arch }}.zip"
-
-      - name: Upload binaries
-        if: ${{ needs.determine-tag.outputs.should_release }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: whisper-cublas-${{ matrix.cuda-toolkit }}-bin-${{ matrix.arch }}.zip
-          path: whisper-cublas-${{ matrix.cuda-toolkit }}-bin-${{ matrix.arch }}.zip
-
-  ios-xcode-build:
-    runs-on: macos-latest
-    needs: determine-tag
-
-    strategy:
-      matrix:
-        build: [Release]
+          - cuda_version: "12.9.1"
+            version_suffix: "12.9"
+            cuda_archs: "52;61;70;75;80;86;89;90"
+          - cuda_version: "13.2.0"
+            version_suffix: "13.2"
+            cuda_archs: "75;80;86;89;90;100;120"
+    if: |
+      (github.event_name == 'push') ||
+      ((inputs.platform == 'all' || inputs.platform == 'linux') &&
+       (inputs.backend == 'all' || inputs.backend == 'cuda'))
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Configure
+      - name: Install dependencies
         run: |
-          cp models/for-tests-ggml-base.en.bin models/ggml-base.en.bin
-          mkdir models/ggml-base.en-encoder.mlmodelc
-
-      - name: Build
-        id: cmake_build
-        run: |
-          sysctl -a
-          mkdir build
-          cd build
-          cmake -G Xcode .. \
-            -DGGML_METAL_USE_BF16=ON \
-            -DGGML_METAL_EMBED_LIBRARY=ON \
-            -DWHISPER_BUILD_EXAMPLES=OFF \
-            -DWHISPER_BUILD_TESTS=OFF \
-            -DWHISPER_BUILD_SERVER=OFF \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
-          cmake --build . --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
-
-      - name: xcodebuild for swift package
-        id: xcodebuild
-        run: |
-          ./build-xcframework.sh
-
-      - name: Build objc example
-        run: xcodebuild -project examples/whisper.objc/whisper.objc.xcodeproj -scheme whisper.objc -configuration ${{ matrix.build }} -sdk iphoneos CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO FRAMEWORK_FOLDER_PATH=./build-ios build
-
-      - name: Build swiftui example
-        run: xcodebuild -project examples/whisper.swiftui/whisper.swiftui.xcodeproj -scheme WhisperCppDemo -configuration ${{ matrix.build }} -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          zip --symlinks -r whisper-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip build-apple/whisper.xcframework
-
-      - name: Upload artifacts
-        if: ${{ needs.determine-tag.outputs.should_release }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          path: whisper-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
-          name: whisper-${{ needs.determine-tag.outputs.tag_name }}-xcframework.zip
-
-  release:
-    if: ${{ github.event.inputs.create_release == 'true' || github.event.inputs.pre_release_tag != '' || startsWith(github.ref, 'refs/tags/v') }}
-
-    runs-on: ubuntu-latest
-
-    needs:
-      - determine-tag
-      - ubuntu-cpu
-      - ios-xcode-build
-      - windows
-      - windows-blas
-      - windows-cublas
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          fetch-depth: 0
+          apt-get update
+          apt-get install -y build-essential git cmake curl
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: release
-          evict-old-files: 1d
+          key: linux-x86_64-cuda${{ matrix.version_suffix }}
+          max-size: 500M
 
-      # Downloads all the artifacts from the previous jobs
-      - name: Download artifacts
-        id: download-artifact
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - name: Build whisper-server
+        run: |
+          mkdir build
+          cd build
+          CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF"
+          CMAKE_ARGS="$CMAKE_ARGS -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_INSTALL_RPATH='\$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}"
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake .. $CMAKE_ARGS
+          cmake --build . --config Release --target whisper-server -j$(nproc)
+          ls -lah bin/
+
+      - name: Find binary path
+        id: find_binary
+        run: |
+          BINARY_PATH=$(find build/bin -name "whisper-server" -type f | head -n 1)
+          if [ -z "$BINARY_PATH" ]; then echo "ERROR: Binary not found!"; exit 1; fi
+          echo "binary_path=$BINARY_PATH" >> $GITHUB_OUTPUT
+
+      - name: Prepare release archive
+        run: |
+          mkdir -p release
+          cp "${{ steps.find_binary.outputs.binary_path }}" "release/whisper-server"
+          for D in build/ggml/src build/bin; do
+            if [ -d "$D" ]; then
+              find "$D" -maxdepth 1 \( -name "*.so" -o -name "*.so.*" \) -exec cp -P {} release/ \;
+            fi
+          done
+          ls -lh release/*.so* 2>/dev/null || echo "No libraries found"
+          echo "whisper-server" > release/version.txt
+          echo "${{ github.ref_name }}" >> release/version.txt
+          echo "Backend: cuda ${{ matrix.version_suffix }}" >> release/version.txt
+          echo "Platform: linux-x86_64" >> release/version.txt
+          echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> release/version.txt
+          chmod +x "release/whisper-server"
+          ls -lah release/
+
+      - name: Create archive
+        run: |
+          tar czf "whisper-server-linux-x86_64-cuda${{ matrix.version_suffix }}.tar.gz" -C release .
+          echo "ARCHIVE_FILE=whisper-server-linux-x86_64-cuda${{ matrix.version_suffix }}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          path: ./artifact
+          name: whisper-server-linux-x86_64-cuda${{ matrix.version_suffix }}
+          path: ${{ env.ARCHIVE_FILE }}
+          retention-days: 7
 
-      - name: Move artifacts
-        id: move_artifacts
-        run: mkdir -p ./artifact/release && mv ./artifact/*/*.zip ./artifact/release && mv ./artifact/*/*.tar.gz ./artifact/release 2>/dev/null || true
+  # Linux ROCm — Docker container, matrix-ized 5.7 + 6.1 (ABI breaks between
+  # ROCm minors; ship both majors), same as the llama.cpp fork.
+  build-rocm:
+    name: Build linux-x86_64-rocm${{ matrix.version_suffix }}
+    runs-on: ubuntu-22.04
+    container: rocm/dev-ubuntu-22.04:${{ matrix.rocm_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rocm_version: "5.7.1"
+            version_suffix: "5.7"
+          - rocm_version: "6.1.2"
+            version_suffix: "6.1"
+    if: |
+      (github.event_name == 'push') ||
+      ((inputs.platform == 'all' || inputs.platform == 'linux') &&
+       (inputs.backend == 'all' || inputs.backend == 'rocm'))
 
-      - name: Create release
-        id: create_release
-        uses: ggml-org/action-create-release@v1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev rocwmma-dev curl
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-x86_64-rocm${{ matrix.version_suffix }}
+          max-size: 500M
+
+      - name: Build whisper-server
+        run: |
+          mkdir build
+          cd build
+          CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF"
+          CMAKE_ARGS="$CMAKE_ARGS -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_INSTALL_RPATH='\$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+          CMAKE_ARGS="$CMAKE_ARGS -DGGML_HIPBLAS=ON"
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake .. $CMAKE_ARGS
+          cmake --build . --config Release --target whisper-server -j$(nproc)
+          ls -lah bin/
+
+      - name: Find binary path
+        id: find_binary
+        run: |
+          BINARY_PATH=$(find build/bin -name "whisper-server" -type f | head -n 1)
+          if [ -z "$BINARY_PATH" ]; then echo "ERROR: Binary not found!"; exit 1; fi
+          echo "binary_path=$BINARY_PATH" >> $GITHUB_OUTPUT
+
+      - name: Prepare release archive
+        run: |
+          mkdir -p release
+          cp "${{ steps.find_binary.outputs.binary_path }}" "release/whisper-server"
+          for D in build/ggml/src build/bin; do
+            if [ -d "$D" ]; then
+              find "$D" -maxdepth 1 \( -name "*.so" -o -name "*.so.*" \) -exec cp -P {} release/ \;
+            fi
+          done
+          ls -lh release/*.so* 2>/dev/null || echo "No libraries found"
+          echo "whisper-server" > release/version.txt
+          echo "${{ github.ref_name }}" >> release/version.txt
+          echo "Backend: rocm ${{ matrix.version_suffix }}" >> release/version.txt
+          echo "Platform: linux-x86_64" >> release/version.txt
+          echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> release/version.txt
+          chmod +x "release/whisper-server"
+          ls -lah release/
+
+      - name: Create archive
+        run: |
+          tar czf "whisper-server-linux-x86_64-rocm${{ matrix.version_suffix }}.tar.gz" -C release .
+          echo "ARCHIVE_FILE=whisper-server-linux-x86_64-rocm${{ matrix.version_suffix }}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-linux-x86_64-rocm${{ matrix.version_suffix }}
+          path: ${{ env.ARCHIVE_FILE }}
+          retention-days: 7
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-matrix, build-cuda, build-rocm]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets + sha256 sidecars
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          cd release-assets
+          # MANDATORY per-asset sha256 sidecar (the voice downloader refuses to
+          # install an artifact whose `<asset>.sha256` is missing/mismatched).
+          # `sha256sum <file>` prints `<64-hex>  <file>`; the downloader reads
+          # only the first token, so the bare-basename form is exactly right.
+          for f in *.tar.gz *.zip; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          echo "Release assets:"
+          ls -lah
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## whisper-server Release ${{ github.ref_name }}
+
+            Prebuilt `whisper-server` (whisper.cpp's OpenAI-compatible transcription
+            server) for the ziee local voice-dictation runtime. Based on whisper.cpp
+            `${{ github.ref_name }}`.
+
+            ### Supported platforms and backends
+
+            - **Linux x86_64**: CPU, CUDA 12.9, CUDA 13.2, ROCm 5.7, ROCm 6.1
+            - **macOS aarch64**: Metal
+            - **Windows x86_64**: CPU, CUDA 12.4, CUDA 13.3
+
+            ### Asset naming
+
+            Each archive is `whisper-server-<platform>-<arch>-<backend>.<ext>` with a
+            matching `<archive>.sha256` sidecar. The ziee voice runtime resolves the
+            latest release, picks the host-matching archive, verifies its sha256
+            sidecar (MANDATORY — install is refused without it), and extracts the
+            `whisper-server` binary + its shared libs (discovered via RPATH `$ORIGIN`
+            / `@loader_path` — no `LD_LIBRARY_PATH` needed).
+
+            ### Installation (manual / air-gapped)
+
+            ```bash
+            tar xzf whisper-server-linux-x86_64-cpu.tar.gz
+            ./whisper-server --help
+            ```
+
+            The transcription model (ggml `.bin`) is downloaded separately by ziee
+            at runtime; this archive ships only the engine.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.determine-tag.outputs.tag_name }}
-          prerelease: ${{ github.event.inputs.pre_release_tag != '' }}
-          draft: true
-
-      - name: Upload release
-        id: upload_release
-        uses: actions/github-script@ffc2c79a5b2490bd33e0a41c1de74b877714d736 # v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            const path = require('path');
-            const fs = require('fs');
-            const release_id = '${{ steps.create_release.outputs.id }}';
-            for (let file of await fs.readdirSync('./artifact/release')) {
-              if (path.extname(file) === '.zip' || file.endsWith('.tar.gz')) {
-                console.log('uploadReleaseAsset', file);
-                await github.repos.uploadReleaseAsset({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  release_id: release_id,
-                  name: file,
-                  data: await fs.readFileSync(`./artifact/release/${file}`)
-                });
-              }
-            }
