@@ -1,0 +1,38 @@
+name: Auto-rerun failed release jobs
+
+# Self-heal for transient CI flakes on the release workflow (chocolatey.org 504s,
+# NVIDIA redist CDN blips, runner hiccups). When "Build and Release whisper-server
+# Binaries" finishes with `failure`, this automatically re-runs ONLY the failed
+# jobs (+ their downstream, e.g. `create-release`) via `gh run rerun --failed`,
+# so a flaky Windows-CUDA install no longer needs a manual rerun to publish.
+#
+# Capped at run_attempt < 3 → at most TWO automatic reruns; a genuine (non-flaky)
+# failure still surfaces red after the retries are exhausted, so this never hides
+# a real bug. `workflow_run` only fires for workflows on the default branch, so
+# this must live on `master` to be active.
+
+on:
+  workflow_run:
+    workflows: ["Build and Release whisper-server Binaries"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun-failed:
+    # Only on failure, and only while attempts remain (1 → rerun → 2 → rerun → 3 stops).
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure' &&
+          github.event.workflow_run.run_attempt < 3 }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run failed jobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Release run ${{ github.event.workflow_run.id }} (attempt ${{ github.event.workflow_run.run_attempt }}) concluded 'failure'."
+          echo "Auto-re-running its failed jobs (transient-flake self-heal; capped at attempt 3)."
+          gh run rerun ${{ github.event.workflow_run.id }} \
+            -R ${{ github.repository }} --failed
